@@ -1,0 +1,17 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build & Run in DOSBox-X",
+      "type": "shell",
+      "command": "${workspaceFolder}\\build_run.bat",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true          // clears the terminal each run
+      }
+    }
+  ]
+}

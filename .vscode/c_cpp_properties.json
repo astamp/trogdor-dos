@@ -1,0 +1,15 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "C:/WATCOM/h"
+            ],
+            "compilerPath": "C:/WATCOM/binnt/wcc",
+            "intelliSenseMode": "gcc-x86",
+            "forcedInclude": ["${workspaceFolder}/vscode_intellisense_shim.h"]            
+        }
+    ],
+    "version": 4
+}
