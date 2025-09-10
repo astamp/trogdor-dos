@@ -2,5 +2,21 @@
     "files.associations": {
         "stdio.h": "c",
         "cstdarg": "c"
+    },
+
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+
+    "[c]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+    },
+    "[cpp]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+    },
+    "[python]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
     }
 }
