@@ -8,7 +8,7 @@
             ],
             "compilerPath": "C:/WATCOM/binnt/wcc",
             "intelliSenseMode": "gcc-x86",
-            "forcedInclude": ["${workspaceFolder}/vscode_intellisense_shim.h"]            
+            "forcedInclude": ["${workspaceFolder}/.vscode/vscode_intellisense_shim.h"]            
         }
     ],
     "version": 4

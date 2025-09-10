@@ -2,10 +2,8 @@
 #include <conio.h>
 #include <i86.h>
 #include <stdlib.h>
-#include <string.h>
 #include <malloc.h>
 #include <stdio.h>
-#include <stdarg.h>
 #include "sb16_audio.h"
 #include "dbg_log.h"
 
@@ -64,8 +62,7 @@ static const unsigned char dma0_page_port[4]  = {0x87,0x83,0x81,0x82};
 
 /* ---- Misc helpers ---- */
 #define DSP_RESET_ACK         0xAA   /* DSP returns 0xAA after reset */
-#define ALIGN_64K_MASK        0xFFFFUL
-#define DMA_ALIGN_SLOP        16UL   /* spare bytes to reach next paragraph */
+/* Removed legacy DMA staging alignment helpers */
 
 /* ---- DSP commands ---- */
 #define DSP_CMD_SPKR_ON      0xD1
@@ -81,10 +78,11 @@ static unsigned         g_engine_rate = SB16_DEFAULT_SRATE;
 static unsigned char    g_prev_pcm_l = 0, g_prev_pcm_r = 0;
 static volatile int     g_have_prev_pcm = 0;
 
-/* DMA buffer: 64K-aligned, up to 64K length */
-static unsigned char __far *g_dma_raw = 0;
-static unsigned char __far *g_dma_buf = 0;
-static unsigned              g_dma_len = 0;
+/* Removed legacy DMA staging buffer state */
+
+/* Direct-playback state for chunked single-cycle DMA */
+static const unsigned char __far * volatile g_cur_src = 0; /* current source pointer */
+static volatile unsigned                    g_bytes_left = 0; /* bytes remaining */
 
 /* Registered waves */
 typedef struct {
@@ -169,10 +167,10 @@ static void parse_blaster(void) {
         while (*env && *env!=' ') ++env;
         while (*env==' ') ++env;
     }
-    /* Sanitize parsed values to safe defaults/ranges */
+    /* check for errors in blaster string */
     {
         unsigned old_base = g_sb_base; int old_irq = g_sb_irq; int old_dma = g_sb_dma8;
-        /* base should be 16-byte aligned and in a typical SB range */
+        /* base should be 16 byte aligned and in a typical SB range */
         if ((g_sb_base & 0xF) != 0 || g_sb_base < 0x200 || g_sb_base > 0x280) g_sb_base = 0x220;
         /* typical SB16 IRQs */
         if (!(g_sb_irq == 5 || g_sb_irq == 7 || g_sb_irq == 10)) g_sb_irq = 7;
@@ -186,24 +184,24 @@ static void parse_blaster(void) {
 
 static int dsp_wait_write(void) {
     /* Wait for write-ready: STATUS bit7 must be 0 to accept a byte */
-    unsigned long t=100000UL; /* iteration guard; not time-accurate */
+    unsigned long t=100000UL; /* this doesn't feel great */
     while (t-- && (inp(SB16_PORT_STATUS(g_sb_base)) & DSP_STATUS_RX_READY)) { }
     return (inp(SB16_PORT_STATUS(g_sb_base)) & DSP_STATUS_RX_READY) ? -1 : 0;
 }
 
 static int dsp_write(unsigned char v) {
     if (dsp_wait_write()!=0) { dbg_log_printf("SB16", "dsp_write timeout: v=%02X status=%02X", v, inp(SB16_PORT_STATUS(g_sb_base))); return -1; }
-    dbg_log_printf("SB16", "dsp_write: v=%02X", v);
+    dbg_vlog_printf("SB16", "dsp_write: v=%02X", v);
     outp(SB16_PORT_WRITE(g_sb_base), v);
     return 0;
 }
 
 static int dsp_reset(void) {
-    unsigned long t=100000UL; /* guard; 0xAA expected within a few ms */
+    unsigned long t=100000UL; /* this also doesn't feel great */
     outp(SB16_PORT_RESET(g_sb_base), 1);
-    delay(3); /* ~3 ms reset pulse */
+    delay(3); /* aboutr 3 ms reset pulse per docs*/
     outp(SB16_PORT_RESET(g_sb_base), 0);
-    /* Wait for data-ready (bit7=1), then expect 0xAA on READ */
+    /* Wait for data-ready (bit7 == 1), then expect 0xAA on READ */
     while (t-- && !(inp(SB16_PORT_STATUS(g_sb_base)) & DSP_STATUS_RX_READY)) { }
     if (!(inp(SB16_PORT_STATUS(g_sb_base)) & DSP_STATUS_RX_READY)) { dbg_log_printf("SB16", "dsp_reset: RX not ready"); return -1; }
     {
@@ -231,15 +229,43 @@ static int irq_to_vector(int irq) {
 
 /* IRQ handler: ACK + clear playing flag */
 static void __interrupt __far sb16_irq_isr(void) {
-    /* Minimal ACK for 8-bit SB16 DMA IRQ */
+    /* ACK SB16 DSP IRQ */
     (void)inp(SB16_PORT_READ(g_sb_base)); /* read once to ACK */
     /* Clear SB16 mixer IRQ status latch (0x82) */
     outp(SB16_PORT_MIXER_ADDR(g_sb_base), 0x82);
     (void)inp(SB16_PORT_MIXER_DATA(g_sb_base));
-    /* Stop DAC output to avoid tail noise */
-    dsp_speaker_off();
-    /* Mark done; defer volume restore outside ISR */
-    g_playing = 0;
+
+    /* If bytes remain, program next non-crossing chunk and restart single-cycle */
+    if (g_bytes_left > 0) {
+        unsigned long lin = ((unsigned long)FP_SEG(g_cur_src) << 4) + FP_OFF(g_cur_src);
+        unsigned off16 = (unsigned)(lin & 0xFFFF);
+        unsigned room = off16 ? (unsigned)(0x10000ul - off16) : 0xFFFFu;
+        unsigned chunk = g_bytes_left;
+        if (chunk > room) chunk = room;
+        if (chunk == 0) chunk = room; /* defensive */
+        /* Program DMA for next chunk from current source */
+        dma_program(g_cur_src, chunk);
+        /* Start next single-cycle block (speaker already on, rate unchanged) */
+        dsp_write(DSP_CMD_8BIT_SINGLE);
+        dsp_write((chunk - 1) & 0xFF);
+        dsp_write(((chunk - 1) >> 8) & 0xFF);
+        /* Advance source pointer across possible 64K wrap */
+        {
+            unsigned sseg = FP_SEG(g_cur_src);
+            unsigned soff = FP_OFF(g_cur_src);
+            unsigned old_off = soff;
+            soff = (unsigned)(soff + chunk);
+            if (soff < old_off) ++sseg; /* wrapped */
+            g_cur_src = (const unsigned char __far *)MK_FP(sseg, soff);
+        }
+        g_bytes_left -= chunk;
+    } else {
+        /* playback finished, stop DAC to avoid lingering click */
+        (void)dsp_write(DSP_CMD_HALT_DMA);
+        dsp_speaker_off();
+        g_playing = 0;
+    }
+    /* Send PIC end of innterupt */
     if (g_sb_irq >= PIC1_IRQ_COUNT) outp(PIC2_CMD_PORT, PIC_EOI_COMMAND);
     outp(PIC1_CMD_PORT, PIC_EOI_COMMAND);
 }
@@ -276,50 +302,49 @@ static void dma_program(const void __far *data, unsigned len) {
     dbg_log_printf("SB16", "dma: ch=%d addr=%04X page=%02X len=%u cnt=%u", ch, addr, page, len, cnt);
     /* 1) Mask the channel so we can safely program registers */
     outp(DMA0_MASK_PORT, DMA0_MASK_SET_BIT | ch);
-    dbg_log_printf("SB16", "dma: masked ch=%d", ch);
+    dbg_vlog_printf("SB16", "dma: masked ch=%d", ch);
     /* 2) Reset the flip‑flop so the next 16‑bit write starts with low byte */
     outp(DMA0_CLEARFF_PORT, 0x00); /* value ignored; write triggers reset */
-    dbg_log_printf("SB16", "dma: clearff #1");
+    dbg_vlog_printf("SB16", "dma: clearff #1");
     /* 3) Set mode: single transfer, increment address, memory→device, for this channel */
     outp(DMA0_MODE_PORT, DMA0_MODE_SINGLE_INC_MEM2DEV | ch);
-    dbg_log_printf("SB16", "dma: mode set");
+    dbg_vlog_printf("SB16", "dma: mode set");
     /* 4) Program base address (low then high) */
     outp(dma0_addr_port[ch], addr & 0xFF);
     outp(dma0_addr_port[ch], (addr >> 8) & 0xFF);
-    dbg_log_printf("SB16", "dma: addr set");
+    dbg_vlog_printf("SB16", "dma: addr set");
     /* 5) Program page register (upper 8 bits of the 20‑bit address) */
     outp(dma0_page_port[ch], page & 0xFF);
-    dbg_log_printf("SB16", "dma: page set");
+    dbg_vlog_printf("SB16", "dma: page set");
     /* 6) Reset flip‑flop again before writing the 16‑bit count */
     outp(DMA0_CLEARFF_PORT, 0x00);
-    dbg_log_printf("SB16", "dma: clearff #2");
+    dbg_vlog_printf("SB16", "dma: clearff #2");
     /* 7) Program count (low then high). Note: cnt == len‑1 */
     outp(dma0_count_port[ch], cnt & 0xFF);
     outp(dma0_count_port[ch], (cnt >> 8) & 0xFF);
-    dbg_log_printf("SB16", "dma: count set");
+    dbg_vlog_printf("SB16", "dma: count set");
     /* 8) Unmask the channel to allow DMA requests */
     outp(DMA0_MASK_PORT, ch);
-    dbg_log_printf("SB16", "dma: unmasked ch=%d", ch);
+    dbg_vlog_printf("SB16", "dma: unmasked ch=%d", ch);
 }
 
 static void sb_start_playback(unsigned len, unsigned hz) {
-    dbg_log_printf("SB16", "start: set_rate=%u", hz);
+    dbg_vlog_printf("SB16", "start: set_rate=%u", hz);
     dsp_set_rate(hz);
-    dbg_log_printf("SB16", "start: speaker on");
+    dbg_vlog_printf("SB16", "start: speaker on");
     dsp_speaker_on();
-    dbg_log_printf("SB16", "start: cmd 8bit single");
+    dbg_vlog_printf("SB16", "start: cmd 8bit single");
     dsp_write(DSP_CMD_8BIT_SINGLE);
     /* SB DSP expects (length-1) low, then high byte */
-    dbg_log_printf("SB16", "start: len-1 lo=%u hi=%u", ((len - 1) & 0xFF), (((len - 1) >> 8) & 0xFF));
+    dbg_vlog_printf("SB16", "start: len-1 lo=%u hi=%u", ((len - 1) & 0xFF), (((len - 1) >> 8) & 0xFF));
     dsp_write((len - 1) & 0xFF);
     dsp_write(((len - 1) >> 8) & 0xFF);
     dbg_log_printf("SB16", "start: len=%u hz=%u ticks=%lu", len, hz, bios_ticks());
 }
 
-/* ---- Public API ---- */
+/* PUBLIC FACING FROM HERE DOWN*/
 int sb16_init(unsigned srate_hz) {
     int vec;
-    unsigned long alloc;
 
     if (srate_hz==0) srate_hz = SB16_DEFAULT_SRATE;
     g_engine_rate = srate_hz;
@@ -335,20 +360,6 @@ int sb16_init(unsigned srate_hz) {
     /* default mixer levels */
     set_master_volume(SB16_DEFAULT_MASTER);
     set_pcm_volume(SB16_DEFAULT_PCM);
-
-    /* Allocate a 64K-aligned DMA buffer with room up to 64K */
-    /* Allocate enough to round up to next 64K boundary */
-    alloc = SB16_MAX_LEN + ALIGN_64K_MASK + DMA_ALIGN_SLOP;
-    g_dma_raw = (unsigned char __far *)_fmalloc(alloc);
-     dbg_log_printf("SB16", "dma_alloc: size=%08lX", alloc);
-    if (!g_dma_raw) return SB16_ERR;
-    {
-        unsigned long lin  = ((unsigned long)FP_SEG(g_dma_raw) << 4) + FP_OFF(g_dma_raw);
-        unsigned long lin2 = (lin + ALIGN_64K_MASK) & ~ALIGN_64K_MASK;  /* ceil to 64K */
-        g_dma_buf = (unsigned char __far *)MK_FP((unsigned)(lin2 >> 4), (unsigned)(lin2 & 0x0F));
-        dbg_log_printf("SB16", "dma_alloc: raw=%04X:%04X lin=%08lX buf=%04X:%04X", FP_SEG(g_dma_raw), FP_OFF(g_dma_raw), lin, FP_SEG(g_dma_buf), FP_OFF(g_dma_buf));
-    }
-    g_dma_len = 0;
 
     /* Install IRQ handler */
     vec = irq_to_vector(g_sb_irq);
@@ -396,8 +407,7 @@ void sb16_shutdown(void) {
     vec = irq_to_vector(g_sb_irq);
     if (g_old_isr) { _dos_setvect(vec, g_old_isr); g_old_isr = 0; }
     sb16_unload_all();
-    if (g_dma_raw) { _ffree(g_dma_raw); g_dma_raw = g_dma_buf = 0; }
-    dbg_log_printf("SB16", "shutdown: ticks=%lu", bios_ticks());
+    dbg_vlog_printf("SB16", "shutdown: ticks=%lu", bios_ticks());
 }
 
 void sb16_unload_all(void) {
@@ -430,22 +440,12 @@ int sb16_register_wave(const unsigned char *pcm_near, unsigned long length, unsi
     return i;
 }
 
-/* Copy PCM bytes using pointer iteration (no movedata). Note: use __huge so
- * pointer arithmetic crosses 64K boundaries correctly on 16:16 pointers. */
-static void copy_u8_far_to_dma(const unsigned char __far *src, unsigned len) {
-    const unsigned char __huge *s = (const unsigned char __huge *)src;
-    unsigned char __huge *d = (unsigned char __huge *)g_dma_buf;
-    while (len--) {
-        *d++ = *s++;
-    }
-}
-
 int sb16_play(unsigned index, unsigned volume) {
     unsigned len;
     unsigned rate;
     if (index >= SB16_MAX_WAVES) return SB16_ERR;
     if (!g_waves[index].used) return SB16_ERR;
-    /* If already playing, preempt the current sound cleanly */
+    /* If already playing, stop the current sound first */
     if (g_playing) {
         dbg_log_printf("SB16", "play preempt: idx=%u", index);
         dsp_write(DSP_CMD_HALT_DMA);   /* stop playback */
@@ -467,22 +467,45 @@ int sb16_play(unsigned index, unsigned volume) {
     g_prev_pcm_r = mixer_read(MIXER_REG_PCM_R);
     g_have_prev_pcm = 1;
     set_pcm_volume((unsigned char)volume);
-    dbg_log_printf("SB16", "play: idx=%u vol=%u len=%u rate=%u", index, volume, len, rate);
-    dbg_log_printf("SB16", "src: %04X:%04X len=%u", FP_SEG(g_waves[index].data), FP_OFF(g_waves[index].data), len);
+    dbg_log_printf("SB16", "play: idx=%u vol=%u len=%u rate=%u", index, volume, len, rate);    
+    dbg_vlog_printf("SB16", "src: %04X:%04X len=%u", FP_SEG(g_waves[index].data), FP_OFF(g_waves[index].data), len);
 
-    /* Always copy into the 64K-aligned DMA buffer to avoid boundary issues */
+    /* Setup DMA transfer for first chunk of data (up to the boundry), ISR sets up second transfer */
     {
         const unsigned char __far *src = g_waves[index].data;
-        unsigned off = FP_OFF(src);
-        dbg_log_printf("SB16", "copy->dma_buf: off=%04X len=%u dst=%04X:%04X", off, len, FP_SEG(g_dma_buf), FP_OFF(g_dma_buf));
-        copy_u8_far_to_dma(src, 2048);
-        g_dma_len = len;
-        /* Program DMA and start playback from DMA buffer */
-        dbg_log_printf("SB16", "pre-dma: src=%04X:%04X len=%u", FP_SEG(g_dma_buf), FP_OFF(g_dma_buf), g_dma_len);
-        dma_program(g_dma_buf, g_dma_len);
+        unsigned long lin0 = ((unsigned long)FP_SEG(src) << 4) + FP_OFF(src);
+        unsigned off16 = (unsigned)(lin0 & 0xFFFF);
+        unsigned room = off16 ? (unsigned)(0x10000ul - off16) : 0xFFFFu;
+        unsigned chunk = len;
+        if (chunk > room) chunk = room;
+        g_cur_src    = src;
+        g_bytes_left = len;
+        
+        /* Program and start first block */
+        dma_program(g_cur_src, chunk);
+        dbg_vlog_printf("SB16", "pre-dma: direct src=%04X:%04X len=%u rem=%u", FP_SEG(g_cur_src), FP_OFF(g_cur_src), chunk, g_bytes_left - chunk);
+        /* Advance source and remaining for ISR */
+        {
+            unsigned sseg = FP_SEG(g_cur_src);
+            unsigned soff = FP_OFF(g_cur_src);
+            unsigned old_off = soff;
+            soff = (unsigned)(soff + chunk);
+            if (soff < old_off) ++sseg; /* wrapped */
+            g_cur_src    = (const unsigned char __far *)MK_FP(sseg, soff);
+        }
+        g_bytes_left -= chunk;
+        g_playing = 1;
+        sb_start_playback(chunk, rate);
     }
-    g_playing = 1;
-    sb_start_playback(g_dma_len, rate);
+    return SB16_OK;
+}
+
+int sb16_play_sync(unsigned index, unsigned volume) {
+    int rc = sb16_play(index, volume);
+    if (rc != SB16_OK) return rc;
+    while (sb16_is_playing()) {
+        delay(1);
+    }
     return SB16_OK;
 }
 
@@ -495,7 +518,6 @@ void sb16_set_mixer(unsigned char master, unsigned char pcm) {
     set_pcm_volume(pcm);
 }
 
-/* Public: query DSP version. Returns 0 on success, -1 on failure. */
 int sb16_get_dsp_version(unsigned char *major, unsigned char *minor) {
     unsigned long t;
     if (dsp_write(0xE1) != 0) return SB16_ERR; /* Get DSP Version */
@@ -600,7 +622,7 @@ int sb16_load_wav(const char *path) {
         if (fmt_rate == 0) fmt_rate = g_engine_rate;
 
         /* Clamp to DMA single-cycle limit */
-        if (data_size > SB16_MAX_LEN) data_size = SB16_MAX_LEN;
+        if (data_size > SB16_MAX_LEN) data_size = SB16_MAX_LEN;        
         to_read = (unsigned)data_size;
 
         /* Flat load into near buffer, then register (copies near->far) */

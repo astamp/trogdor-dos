@@ -28,6 +28,9 @@ void sb16_unload_all(void);
 /* Play a previously registered waveform by index with per-play volume 0..255.
  * Non-blocking; returns 0 on success, -1 on busy/error. */
 int  sb16_play(unsigned index, unsigned volume);
+/* Blocking helper: plays a waveform and waits until it completes.
+ * Returns 0 on success, -1 on busy/error. */
+int  sb16_play_sync(unsigned index, unsigned volume);
 
 /* Non-zero while playback is active. */
 int  sb16_is_playing(void);
