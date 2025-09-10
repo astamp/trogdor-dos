@@ -1,0 +1,172 @@
+#include "keybrd.h"
+#include "ring.h"
+
+#include <dos.h>
+#include <i86.h>
+#include <stddef.h>
+
+static volatile unsigned char escape;
+static void (__interrupt __far *old_keyboard_isr)() = NULL;
+
+#ifdef DEBUG_KEYBRD
+volatile unsigned char history[32];
+volatile int hist_idx;
+#endif
+
+enum {
+    SC_ESC,
+    SC_ENTER,
+    SC_UP,
+    SC_DOWN,
+    SC_LEFT,
+    SC_RIGHT,
+    SC_W,
+    SC_A,
+    SC_S,
+    SC_D,
+    SC_SPACE,
+    SC_COUNT
+};
+
+unsigned char key_down[SC_COUNT];
+
+static key_t on_key_down(int idx, key_t output) {
+    if (!key_down[idx]) {
+        key_down[idx] = 1;
+        return output;
+    }
+    return KX_NONE;
+}
+
+static key_t on_key_up(int idx, key_t output) {
+    if (key_down[idx]) {
+        key_down[idx] = 0;
+        return output;
+    }
+    return KX_NONE;
+}
+
+static void __interrupt __far keyboard_isr()
+{
+    unsigned char sc;
+    key_t temp = KX_NONE;
+
+    _asm {
+        in al, 0x60     // Read from keyboard.
+        mov sc, al      // Save scancode.
+        in al, 0x61     // Get current PORTB.
+        mov ah, al      // Save it for later.
+        or al, 0x80     // OR in clear keyboard bit.
+        out 0x61, al    // Write it out to clear keyboard.
+        xchg al, ah     // Get original PORTB.
+        out 0x61, al    // Write it back to enable keyboard.
+
+        mov al, 0x20    // End of interrupt command.
+        out 0x20, al    // Write it to the first 8259.
+    };
+
+#ifdef DEBUG_KEYBRD
+    history[hist_idx++] = sc;
+    if (hist_idx >= sizeof(history)) { hist_idx = 0; }
+#endif
+    
+    escape = sc;
+    if (sc >= 0xE0 && sc <= 0xE2) {
+        return;
+    }
+
+    switch (sc) {
+        // Left arrow.
+        case 0x4B: temp = on_key_down(SC_LEFT, KD_P2_LEFT); break;
+        case 0xCB: temp = on_key_up(SC_LEFT, KU_P2_LEFT); break;
+        
+        // A.
+        case 0x1E: temp = on_key_down(SC_A, KD_P1_LEFT); break;
+        case 0x9E: temp = on_key_up(SC_A, KU_P1_LEFT); break;
+        
+        // Up arrow.
+        case 0x48: temp = on_key_down(SC_UP, KD_P2_UP); break;
+        case 0xC8: temp = on_key_up(SC_UP, KU_P2_UP); break;
+        
+        // W.
+        case 0x11: temp = on_key_down(SC_W, KD_P1_UP); break;
+        case 0x91: temp = on_key_up(SC_W, KU_P1_UP); break;
+        
+        // Right arrow.
+        case 0x4D: temp = on_key_down(SC_RIGHT, KD_P2_RIGHT); break;
+        case 0xCD: temp = on_key_up(SC_RIGHT, KU_P2_RIGHT); break;
+        
+        // D.
+        case 0x20: temp = on_key_down(SC_D, KD_P1_RIGHT); break;
+        case 0xA0: temp = on_key_up(SC_D, KU_P1_RIGHT); break;
+        
+        // Down arrow.
+        case 0x50: temp = on_key_down(SC_DOWN, KD_P2_DOWN); break;
+        case 0xD0: temp = on_key_up(SC_DOWN, KU_P2_DOWN); break;
+        
+        // S.
+        case 0x1F: temp = on_key_down(SC_S, KD_P1_DOWN); break;
+        case 0x9F: temp = on_key_up(SC_S, KU_P1_DOWN); break;
+        
+        case 0x01: temp = KX_ESCAPE; break;
+        case 0x1C: temp = KX_ENTER; break;
+        case 0x39: temp = KX_SPACE; break;
+    }
+    
+    if (KX_NONE != temp) {
+        RING_put((ring_item_t)temp);
+    }
+
+}
+
+key_t KEYBRD_read(void)
+{
+    key_t key = KX_NONE;
+    do {
+        key = KEYBRD_poll();
+    } while (KX_NONE == key);
+
+    return key;
+}
+
+key_t KEYBRD_poll(void)
+{
+    key_t key = KX_NONE;
+
+    if (RING_get((ring_item_t*)&key)) {
+        return key;
+    } else {
+        return KX_NONE;
+    }
+}
+
+void KEYBRD_init(void)
+{
+    int x;
+#ifdef DEBUG_KEYBRD
+    for (x = 0; x < sizeof(history); x++) {
+        history[x] = 0xFF;
+    }
+    hist_idx = 0;
+#endif
+    // Initialize the key states for up/down processing.
+    for (x = 0; x < sizeof(key_down); x++) {
+        key_down[x] = 0;
+    }
+
+    // Initialize the ring buffer used by the ISR.
+    RING_init();
+
+    // Must save the old ISR to restore it at the end!
+    old_keyboard_isr = _dos_getvect(0x09);
+
+    _dos_setvect(0x09, keyboard_isr);
+
+}
+
+void KEYBRD_fini(void) {
+    if (NULL != old_keyboard_isr) {
+        _dos_setvect(0x09, old_keyboard_isr);
+    }
+}
+
